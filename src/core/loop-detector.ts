@@ -8,6 +8,11 @@
  * - Edit-revert-edit cycles
  * 
  * Each detected loop is logged with type, content, and count.
+ * 
+ * IMPORTANT: Both Claude Code and OpenCode use interactive TUI frameworks
+ * (Ink/React for Claude, Bubble Tea for OpenCode) that constantly redraw
+ * the screen. The detector must filter out TUI rendering artifacts like
+ * status bars, progress indicators, and panel redraws.
  */
 
 export interface LoopEvent {
@@ -20,26 +25,51 @@ export interface LoopEvent {
 
 export type OptimizationLevel = 'safe' | 'balanced' | 'aggressive';
 
-// Patterns to detect agent actions in terminal output
-// These cover common output formats for Claude Code and OpenCode
+// ── TUI Noise Filters ──────────────────────────────────────────────────────
+// Lines matching these patterns are TUI rendering artifacts (status bars,
+// progress indicators, panel redraws) and must be stripped before analysis.
+const TUI_NOISE_PATTERNS = [
+  // Status bars, spinners, and progress indicators
+  /^[\s│┃|]*[●○◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷▏▎▍▌▋▊▉█░▒▓·•…]/, 
+  // OpenCode/Claude status lines (model names, costs, token counts)
+  /\b\d+(\.\d+)?[KkMm]?\s*\(\d+%?\)\s*·?\s*\$[\d.]+/,
+  /\b(esc|ctrl\+\w|enter|tab)\b.*\b(interrupt|submit|commands|cancel)\b/i,
+  // Version strings, session IDs
+  /(?:opencode|claude)\s+[\d.]+/i,
+  // Short lines that are likely UI chrome (borders, separators, etc.)
+  /^[\s─━═│┃┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬░▒▓█▄▀·•→←↑↓►◄▶◀]+$/,
+  // Cursor movement residue and bare control chars
+  /^\s{0,4}[A-Z][a-z]{0,2}\s*$/,  // Two/three letter fragments from redraws
+  // Build/session indicator lines
+  /^\s*(?:Build|Session|Continue)\s*·/,
+];
+
+// ── Agent Action Patterns ──────────────────────────────────────────────────
+// These are more specific than before to avoid matching TUI noise.
+// Each pattern requires clear contextual markers that TUI redraws don't have.
+
 const FILE_READ_PATTERNS = [
-  /(?:Read|Reading|Cat|View(?:ing)?)\s+(?:file:?\s*)?[`"']?([^\s`"'\n]+\.\w+)[`"']?/gi,
-  /(?:cat|less|head|tail|bat)\s+([^\s|>\n]+\.\w+)/gi,
+  // Claude Code: "Read file: path/to/file.ts"  or  "Reading path/to/file.ts"
+  /^\s*(?:Read(?:ing)?)\s+(?:file:?\s*)?[`"']?([^\s`"'\n]{4,}\.\w{1,10})[`"']?\s*$/gim,
+  // Shell commands that read files
+  /^\s*(?:cat|less|head|tail|bat)\s+([^\s|>\n]{4,}\.\w{1,10})\s*$/gim,
 ];
 
 const COMMAND_EXEC_PATTERNS = [
-  /(?:Running|Executing|Exec|Run|bash|shell|command)[:>]?\s*[`"']?(.+?)[`"']?\s*$/gim,
-  /\$\s+(.+)$/gim,
-  /(?:❯|›|>)\s+(.+)$/gim,
+  // Claude Code: "Running: npm test"  OpenCode: "Executing: npm test"
+  /^\s*(?:Running|Executing)[:\s]+[`"']?(.{5,120})[`"']?\s*$/gim,
+  // Shell prompt with actual command ($ npm test, ❯ npm test)
+  /^\s*\$\s+(.{5,120})\s*$/gim,
 ];
 
 const ERROR_PATTERNS = [
-  /(?:error|Error|ERROR|FAIL|fail|Failed|FAILED)[:\s]+(.+)/gi,
-  /(?:✗|✖|×)\s+(.+)/gi,
+  // Explicit error lines with substantive content (not single words)
+  /^\s*(?:error|Error|ERROR|FAIL|Failed|FAILED)[:\s]+(.{10,})/gim,
 ];
 
 const EDIT_PATTERNS = [
-  /(?:Edit(?:ing|ed)?|Writ(?:e|ing|ten)|Updat(?:e|ing|ed)|Modif(?:y|ying|ied))\s+(?:file:?\s*)?[`"']?([^\s`"'\n]+\.\w+)[`"']?/gi,
+  // Claude Code: "Edited file: path/to/file.ts"  OpenCode: "Writing path/to/file.ts"
+  /^\s*(?:Edit(?:ing|ed)?|Writ(?:e|ing|ten|wrote)|Updat(?:e|ing|ed))\s+(?:file:?\s*)?[`"']?([^\s`"'\n]{4,}\.\w{1,10})[`"']?\s*$/gim,
 ];
 
 export class LoopDetector {
@@ -59,7 +89,7 @@ export class LoopDetector {
   private thresholds: Record<OptimizationLevel, number> = {
     safe: 5,       // Very tolerant — only flag extreme repetition
     balanced: 3,   // Flag after 3 repeats
-    aggressive: 2, // Flag after 2 repeats
+    aggressive: 3, // Same threshold as balanced (was 2, too aggressive for TUI agents)
   };
 
   private level: OptimizationLevel;
@@ -69,10 +99,34 @@ export class LoopDetector {
   }
 
   /**
+   * Clean TUI noise from agent output before analysis.
+   * Removes status bars, spinners, panel borders, and other
+   * rendering artifacts that would cause false positive detections.
+   */
+  private cleanTuiNoise(output: string): string {
+    const lines = output.split('\n');
+    const cleanLines = lines.filter(line => {
+      const trimmed = line.trim();
+      // Skip empty or very short lines (UI fragments)
+      if (trimmed.length < 8) return false;
+      // Skip lines matching TUI noise patterns
+      for (const pattern of TUI_NOISE_PATTERNS) {
+        if (pattern.test(trimmed)) return false;
+      }
+      return true;
+    });
+    return cleanLines.join('\n');
+  }
+
+  /**
    * Analyze a chunk of agent output for loop patterns.
    * Returns any newly detected loop events.
    */
   analyzeOutput(output: string): LoopEvent[] {
+    // Clean TUI noise first — this is critical for avoiding false positives
+    const cleanOutput = this.cleanTuiNoise(output);
+    if (cleanOutput.trim().length < 10) return [];
+
     const newEvents: LoopEvent[] = [];
     const threshold = this.thresholds[this.level];
 
@@ -80,8 +134,10 @@ export class LoopDetector {
     for (const pattern of FILE_READ_PATTERNS) {
       pattern.lastIndex = 0;
       let match;
-      while ((match = pattern.exec(output)) !== null) {
+      while ((match = pattern.exec(cleanOutput)) !== null) {
         const file = this.normalizePath(match[1]);
+        if (this.isLikelyNoise(file)) continue;
+
         const count = (this.fileReadHistory.get(file) ?? 0) + 1;
         this.fileReadHistory.set(file, count);
 
@@ -96,9 +152,10 @@ export class LoopDetector {
     for (const pattern of COMMAND_EXEC_PATTERNS) {
       pattern.lastIndex = 0;
       let match;
-      while ((match = pattern.exec(output)) !== null) {
+      while ((match = pattern.exec(cleanOutput)) !== null) {
         const cmd = match[1].trim();
-        if (cmd.length < 3 || cmd.length > 200) continue; // Skip noise
+        if (cmd.length < 5 || cmd.length > 200) continue;
+        if (this.isLikelyNoise(cmd)) continue;
 
         const normalized = this.normalizeCommand(cmd);
         const count = (this.commandHistory.get(normalized) ?? 0) + 1;
@@ -115,8 +172,10 @@ export class LoopDetector {
     for (const pattern of ERROR_PATTERNS) {
       pattern.lastIndex = 0;
       let match;
-      while ((match = pattern.exec(output)) !== null) {
-        const error = match[1].trim().substring(0, 100); // Cap length
+      while ((match = pattern.exec(cleanOutput)) !== null) {
+        const error = match[1].trim().substring(0, 100);
+        if (this.isLikelyNoise(error)) continue;
+
         const normalized = error.toLowerCase();
         const count = (this.errorHistory.get(normalized) ?? 0) + 1;
         this.errorHistory.set(normalized, count);
@@ -132,8 +191,10 @@ export class LoopDetector {
     for (const pattern of EDIT_PATTERNS) {
       pattern.lastIndex = 0;
       let match;
-      while ((match = pattern.exec(output)) !== null) {
+      while ((match = pattern.exec(cleanOutput)) !== null) {
         const file = this.normalizePath(match[1]);
+        if (this.isLikelyNoise(file)) continue;
+
         const history = this.editHistory.get(file) ?? { count: 0, lastAction: 'edit' as const };
         history.count += 1;
         this.editHistory.set(file, history);
@@ -150,15 +211,18 @@ export class LoopDetector {
 
   /**
    * Analyze using a simple line-similarity heuristic.
-   * If the same block of text (>50 chars) appears repeatedly,
+   * If the same block of text (>100 chars) appears repeatedly,
    * that's a generic loop.
    */
   analyzeGenericRepetition(output: string): LoopEvent[] {
+    const cleanOutput = this.cleanTuiNoise(output);
+    if (cleanOutput.trim().length < 100) return [];
+
     const newEvents: LoopEvent[] = [];
     const threshold = this.thresholds[this.level];
 
-    // Split into meaningful chunks (paragraphs)
-    const chunks = output.split(/\n{2,}/).filter(c => c.trim().length > 50);
+    // Split into meaningful chunks (paragraphs) — require 100+ chars to filter noise
+    const chunks = cleanOutput.split(/\n{2,}/).filter(c => c.trim().length > 100);
 
     for (const chunk of chunks) {
       const key = this.hashChunk(chunk.trim());
@@ -183,20 +247,20 @@ export class LoopDetector {
   }
 
   /**
-   * Get a nudge message for the agent based on the loop type.
+   * Get a nudge message for the user based on the loop type.
    */
   getNudgeMessage(event: LoopEvent): string {
     switch (event.type) {
       case 'file_read':
-        return `[SmartCode] You've already read "${event.content}" ${event.count} times this session. The content hasn't changed since your last read. Please proceed with the information you already have.\n`;
+        return `File "${event.content}" read ${event.count} times — content unchanged.`;
       case 'command_exec':
-        return `[SmartCode] The command "${event.content}" has been executed ${event.count} times with the same result. Try a different approach.\n`;
+        return `Command "${event.content}" executed ${event.count} times with same result.`;
       case 'error_repeat':
-        return `[SmartCode] This error has occurred ${event.count} times: "${event.content}". The same approach is failing repeatedly. Try an alternative solution.\n`;
+        return `Same error repeated ${event.count} times: "${event.content}"`;
       case 'edit_cycle':
-        return `[SmartCode] File "${event.content}" has been edited ${event.count} times. You may be in an edit-revert cycle. Step back and reconsider your approach.\n`;
+        return `File "${event.content}" edited ${event.count} times — possible edit cycle.`;
       case 'generic':
-        return `[SmartCode] Repeated pattern detected (${event.count}x). Consider a different approach.\n`;
+        return `Repeated pattern detected (${event.count}x).`;
     }
   }
 
@@ -251,14 +315,27 @@ export class LoopDetector {
   }
 
   private normalizeCommand(cmd: string): string {
-    // Normalize whitespace and lowercase for comparison
     return cmd.replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
   private hashChunk(text: string): string {
-    // Simple hash: first 20 chars + length + last 20 chars
     const trimmed = text.replace(/\s+/g, ' ').toLowerCase();
     return `${trimmed.substring(0, 20)}:${trimmed.length}:${trimmed.substring(trimmed.length - 20)}`;
+  }
+
+  /**
+   * Check if a matched string is likely TUI noise rather than real content.
+   */
+  private isLikelyNoise(text: string): boolean {
+    // Too short to be a real file path or command
+    if (text.length < 4) return true;
+    // Contains box-drawing chars or heavy unicode (TUI chrome)
+    if (/[─━═│┃┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬░▒▓█▄▀●○◐◑]/.test(text)) return true;
+    // Looks like a version string or status fragment
+    if (/^\d+\.\d+\.\d+/.test(text)) return true;
+    // Single word that could be a UI label
+    if (!/\s/.test(text) && !/[./\\]/.test(text) && text.length < 15) return true;
+    return false;
   }
 
   /**
@@ -270,7 +347,6 @@ export class LoopDetector {
     const reportKey = `${type}:${key}:${count}`;
     if (this.reportedPatterns.has(reportKey)) return false;
 
-    // Report at threshold, then at 2x, 4x, 8x, etc.
     let reportAt = threshold;
     while (reportAt < count) {
       reportAt *= 2;

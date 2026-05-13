@@ -11,6 +11,8 @@
  * No hardcoded values. Every metric comes from real observations.
  */
 
+import { execSync } from 'child_process';
+import os from 'os';
 import { PtyManager, PtyDataEvent } from './pty-manager.js';
 import { LoopDetector, LoopEvent, OptimizationLevel } from './loop-detector.js';
 import { Analytics } from './analytics.js';
@@ -54,16 +56,44 @@ export class SmartCodeRuntime {
     }
   }
 
+  /**
+   * Verify the selected agent is installed and accessible on PATH.
+   */
+  private verifyAgentInstalled(): boolean {
+    const command = this.config.name === 'claude' ? 'claude' : 'opencode';
+    const checker = os.platform() === 'win32' ? 'where' : 'which';
+
+    try {
+      execSync(`${checker} ${command}`, { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   public async runSession(): Promise<void> {
+    // --- Pre-flight: verify agent is installed ---
+    if (!this.verifyAgentInstalled()) {
+      const agentDisplay = this.config.name === 'claude' ? 'Claude Code' : 'OpenCode';
+      const installHint = this.config.name === 'claude'
+        ? 'npm install -g @anthropic-ai/claude-code'
+        : 'See https://opencode.ai for installation instructions';
+
+      console.error(`\n❌ ${agentDisplay} is not installed or not found on PATH.`);
+      console.error(`   Install it first: ${installHint}`);
+      console.error(`   Then run smartcode again.\n`);
+      return;
+    }
+
     console.log(`[SmartCode] Session: ${this.sessionId}`);
     console.log(`[SmartCode] Agent: ${this.config.name} | Level: ${this.config.optimizationLevel} | Style: ${this.config.responseStyle}`);
 
     if (this.config.responseStyle !== 'normal') {
-      console.log(`[SmartCode] Response style "${this.config.responseStyle}" will be enforced via system prompt injection.`);
+      console.log(`[SmartCode] Response style "${this.config.responseStyle}" enforced via system prompt.`);
     }
 
-    console.log(`[SmartCode] Loop detection active (threshold: ${this.config.optimizationLevel}).`);
-    console.log(`[SmartCode] Handing over control to ${this.config.name}...`);
+    console.log(`[SmartCode] Loop detection active (${this.config.optimizationLevel}).`);
+    console.log(`[SmartCode] Handing over to ${this.config.name}...`);
     console.log(`────────────────────────────────────────────────────────\n`);
 
     // Record session in DB
@@ -76,7 +106,7 @@ export class SmartCodeRuntime {
 
     // --- Wire up event handlers ---
 
-    // Track agent output for analytics and loop detection
+    // Track agent output for analytics
     this.ptyManager.on('data', (event: PtyDataEvent) => {
       this.analytics.recordAgentOutput(event.raw.length);
     });
@@ -96,7 +126,6 @@ export class SmartCodeRuntime {
     // Track user input for analytics
     this.ptyManager.on('user-input', (input: string) => {
       this.analytics.recordUserInput(input.length);
-      // Each user input is an interaction
       if (input.includes('\r') || input.includes('\n')) {
         this.analytics.recordInteraction();
       }
@@ -127,21 +156,30 @@ export class SmartCodeRuntime {
 
   /**
    * Handle a detected loop event based on optimization level.
+   * 
+   * IMPORTANT: We NEVER inject text into the agent's stdin.
+   * Both Claude Code and OpenCode use interactive TUI frameworks.
+   * Injecting raw text into their stdin would be interpreted as
+   * random keystrokes, breaking the TUI rendering.
+   * 
+   * Instead, all levels display warnings via stderr (visible to the
+   * user but not captured by the agent). The difference between levels
+   * is how prominently and how early warnings appear.
    */
   private handleLoopEvent(event: LoopEvent): void {
+    const message = this.loopDetector.getNudgeMessage(event);
+
     switch (this.config.optimizationLevel) {
       case 'aggressive':
-        // Inject a nudge message into the agent's stdin
-        const nudge = this.loopDetector.getNudgeMessage(event);
-        this.ptyManager.write(nudge);
+        // Prominent warning with bell character to draw attention
+        process.stderr.write(`\n\x07⚠️  [SmartCode] ${message}\n`);
         this.loopDetector.markIntervened(event);
         this.analytics.recordWastedBytes(event.content.length * event.count);
         break;
 
       case 'balanced':
-        // Show a warning to the user (but don't inject into agent)
-        // We write directly to process.stderr to avoid it being captured as agent output
-        process.stderr.write(`\n⚠️  [SmartCode] ${this.loopDetector.getNudgeMessage(event)}`);
+        // Quieter warning
+        process.stderr.write(`\n⚠️  [SmartCode] ${message}\n`);
         break;
 
       case 'safe':

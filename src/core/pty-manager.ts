@@ -64,7 +64,17 @@ export class PtyManager extends EventEmitter {
 
     return new Promise<number>((resolve, reject) => {
       try {
-        this.ptyProcess = pty.spawn(options.command, options.args, {
+        // On Windows, node-pty's spawn uses CreateProcess directly, which
+        // cannot resolve .cmd/.bat wrappers (e.g., 'opencode.cmd', 'claude.cmd'
+        // installed via npm). Route through cmd.exe /c to let Windows handle
+        // PATH resolution and extension matching — same as typing in a terminal.
+        const isWindows = os.platform() === 'win32';
+        const spawnCommand = isWindows ? 'cmd.exe' : options.command;
+        const spawnArgs = isWindows
+          ? ['/c', options.command, ...options.args]
+          : options.args;
+
+        this.ptyProcess = pty.spawn(spawnCommand, spawnArgs, {
           name: 'xterm-256color',
           cols,
           rows,
@@ -101,7 +111,11 @@ export class PtyManager extends EventEmitter {
           this.emit('data', event);
 
           // Forward to real terminal so user sees everything
-          process.stdout.write(rawData);
+          try {
+            process.stdout.write(rawData);
+          } catch {
+            // EAGAIN: stdout not writable (terminal closing) — ignore
+          }
         });
 
         // --- User keyboard → our tracking + agent stdin ---

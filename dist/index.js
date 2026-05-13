@@ -22,7 +22,7 @@ program.action(async () => {
             choices: [
                 { name: 'Safe (track only, no intervention)', value: 'safe' },
                 { name: 'Balanced (warn on loops)', value: 'balanced' },
-                { name: 'Aggressive (auto-intervene on loops)', value: 'aggressive' },
+                { name: 'Aggressive (early + loud loop warnings)', value: 'aggressive' },
             ],
         });
         const responseStyle = await select({
