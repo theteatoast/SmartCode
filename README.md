@@ -1,4 +1,7 @@
-# ⚡ SmartCode
+# FYI: I initially though this was a good approach but this aint the efficient one so will make a agent skill next based on the same idea. Abandoning this.
+
+
+# SmartCode
 
 **The runtime layer for efficient AI coding.**
 
