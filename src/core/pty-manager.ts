@@ -38,6 +38,9 @@ export class PtyManager extends EventEmitter {
   /** Buffer accumulating output between user inputs for analysis */
   private outputBuffer: string = '';
 
+  /** Cap the output buffer at 64KB to prevent unbounded memory growth */
+  private static readonly MAX_BUFFER_SIZE = 64 * 1024;
+
   /** Total bytes the agent has written to stdout */
   public totalBytesOut: number = 0;
 
@@ -47,12 +50,15 @@ export class PtyManager extends EventEmitter {
   /** Whether the PTY process is currently running */
   public isRunning: boolean = false;
 
+  /** References for cleanup */
+  private onStdinData: ((data: Buffer) => void) | null = null;
+  private onResize: (() => void) | null = null;
+
   async spawn(options: PtyManagerOptions): Promise<number> {
     // strip-ansi is ESM-only, must use dynamic import
     const stripAnsiModule = await import('strip-ansi');
     this.stripAnsi = stripAnsiModule.default;
 
-    const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
     const cols = options.cols ?? process.stdout.columns ?? 120;
     const rows = options.rows ?? process.stdout.rows ?? 30;
 
@@ -78,7 +84,12 @@ export class PtyManager extends EventEmitter {
         this.ptyProcess.onData((rawData: string) => {
           this.totalBytesOut += rawData.length;
           const cleanData = this.stripAnsi!(rawData);
+
+          // Append to buffer, but cap it to prevent memory issues
           this.outputBuffer += cleanData;
+          if (this.outputBuffer.length > PtyManager.MAX_BUFFER_SIZE) {
+            this.outputBuffer = this.outputBuffer.slice(-PtyManager.MAX_BUFFER_SIZE);
+          }
 
           const event: PtyDataEvent = {
             raw: rawData,
@@ -94,7 +105,7 @@ export class PtyManager extends EventEmitter {
         });
 
         // --- User keyboard → our tracking + agent stdin ---
-        const onStdinData = (data: Buffer) => {
+        this.onStdinData = (data: Buffer) => {
           if (!this.ptyProcess || !this.isRunning) return;
 
           const str = data.toString();
@@ -116,10 +127,10 @@ export class PtyManager extends EventEmitter {
           process.stdin.setRawMode(true);
         }
         process.stdin.resume();
-        process.stdin.on('data', onStdinData);
+        process.stdin.on('data', this.onStdinData);
 
         // Handle terminal resize
-        const onResize = () => {
+        this.onResize = () => {
           if (this.ptyProcess && this.isRunning) {
             this.ptyProcess.resize(
               process.stdout.columns ?? cols,
@@ -127,7 +138,14 @@ export class PtyManager extends EventEmitter {
             );
           }
         };
-        process.stdout.on('resize', onResize);
+        process.stdout.on('resize', this.onResize);
+
+        // --- Handle SIGINT/SIGTERM gracefully ---
+        const onSignal = () => {
+          this.cleanup();
+        };
+        process.on('SIGINT', onSignal);
+        process.on('SIGTERM', onSignal);
 
         // --- Process exit ---
         this.ptyProcess.onExit(({ exitCode }) => {
@@ -140,12 +158,9 @@ export class PtyManager extends EventEmitter {
           }
 
           // Cleanup
-          process.stdin.removeListener('data', onStdinData);
-          process.stdout.removeListener('resize', onResize);
-          if (process.stdin.isTTY) {
-            process.stdin.setRawMode(false);
-          }
-          process.stdin.pause();
+          this.cleanup();
+          process.removeListener('SIGINT', onSignal);
+          process.removeListener('SIGTERM', onSignal);
 
           this.emit('exit', exitCode);
           resolve(exitCode);
@@ -155,6 +170,29 @@ export class PtyManager extends EventEmitter {
         reject(err);
       }
     });
+  }
+
+  /**
+   * Clean up stdin/stdout listeners and restore terminal state.
+   * Safe to call multiple times.
+   */
+  private cleanup(): void {
+    if (this.onStdinData) {
+      process.stdin.removeListener('data', this.onStdinData);
+      this.onStdinData = null;
+    }
+    if (this.onResize) {
+      process.stdout.removeListener('resize', this.onResize);
+      this.onResize = null;
+    }
+    if (process.stdin.isTTY) {
+      try {
+        process.stdin.setRawMode(false);
+      } catch {
+        // May already be destroyed
+      }
+    }
+    process.stdin.pause();
   }
 
   /**

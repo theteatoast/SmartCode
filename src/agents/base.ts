@@ -1,4 +1,4 @@
-import { PtyManager, PtyDataEvent } from '../core/pty-manager.js';
+import { PtyManager } from '../core/pty-manager.js';
 import { PromptInjector, ResponseStyle } from '../core/prompt-injector.js';
 
 export interface AgentConfig {

@@ -49,6 +49,9 @@ export class LoopDetector {
   private editHistory: Map<string, { count: number; lastAction: 'edit' | 'revert' }> = new Map();
   private genericHistory: Map<string, number> = new Map();
 
+  /** Track which pattern+count combos have been reported to avoid duplicate events */
+  private reportedPatterns: Set<string> = new Set();
+
   /** All detected loop events this session */
   public events: LoopEvent[] = [];
 
@@ -82,7 +85,7 @@ export class LoopDetector {
         const count = (this.fileReadHistory.get(file) ?? 0) + 1;
         this.fileReadHistory.set(file, count);
 
-        if (count >= threshold) {
+        if (count >= threshold && this.shouldReport('file_read', file, count, threshold)) {
           const event = this.createEvent('file_read', file, count);
           newEvents.push(event);
         }
@@ -101,7 +104,7 @@ export class LoopDetector {
         const count = (this.commandHistory.get(normalized) ?? 0) + 1;
         this.commandHistory.set(normalized, count);
 
-        if (count >= threshold) {
+        if (count >= threshold && this.shouldReport('command_exec', normalized, count, threshold)) {
           const event = this.createEvent('command_exec', cmd, count);
           newEvents.push(event);
         }
@@ -118,7 +121,7 @@ export class LoopDetector {
         const count = (this.errorHistory.get(normalized) ?? 0) + 1;
         this.errorHistory.set(normalized, count);
 
-        if (count >= threshold) {
+        if (count >= threshold && this.shouldReport('error_repeat', normalized, count, threshold)) {
           const event = this.createEvent('error_repeat', error, count);
           newEvents.push(event);
         }
@@ -135,7 +138,7 @@ export class LoopDetector {
         history.count += 1;
         this.editHistory.set(file, history);
 
-        if (history.count >= threshold + 1) {
+        if (history.count >= threshold + 1 && this.shouldReport('edit_cycle', file, history.count, threshold + 1)) {
           const event = this.createEvent('edit_cycle', file, history.count);
           newEvents.push(event);
         }
@@ -162,7 +165,7 @@ export class LoopDetector {
       const count = (this.genericHistory.get(key) ?? 0) + 1;
       this.genericHistory.set(key, count);
 
-      if (count >= threshold) {
+      if (count >= threshold && this.shouldReport('generic', key, count, threshold)) {
         const preview = chunk.trim().substring(0, 80) + '...';
         const event = this.createEvent('generic', preview, count);
         newEvents.push(event);
@@ -225,6 +228,7 @@ export class LoopDetector {
     this.errorHistory.clear();
     this.editHistory.clear();
     this.genericHistory.clear();
+    this.reportedPatterns.clear();
     this.events = [];
   }
 
@@ -255,5 +259,25 @@ export class LoopDetector {
     // Simple hash: first 20 chars + length + last 20 chars
     const trimmed = text.replace(/\s+/g, ' ').toLowerCase();
     return `${trimmed.substring(0, 20)}:${trimmed.length}:${trimmed.substring(trimmed.length - 20)}`;
+  }
+
+  /**
+   * Determine if a pattern should be reported at this count.
+   * Reports at threshold, then at exponentially increasing intervals
+   * (2x, 4x, 8x threshold) to avoid spamming events.
+   */
+  private shouldReport(type: string, key: string, count: number, threshold: number): boolean {
+    const reportKey = `${type}:${key}:${count}`;
+    if (this.reportedPatterns.has(reportKey)) return false;
+
+    // Report at threshold, then at 2x, 4x, 8x, etc.
+    let reportAt = threshold;
+    while (reportAt < count) {
+      reportAt *= 2;
+    }
+    if (count !== reportAt && count !== threshold) return false;
+
+    this.reportedPatterns.add(reportKey);
+    return true;
   }
 }

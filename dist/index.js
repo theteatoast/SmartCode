@@ -8,7 +8,7 @@ program
     .description('The runtime layer for efficient AI coding.')
     .version('1.0.0');
 program.action(async () => {
-    console.log('\nSMARTCODE\n');
+    console.log('\n⚡ SMARTCODE\n');
     try {
         const agent = await select({
             message: 'Select agent:',
@@ -20,21 +20,22 @@ program.action(async () => {
         const optimizationLevel = await select({
             message: 'Optimization Level:',
             choices: [
-                { name: 'Safe', value: 'safe' },
-                { name: 'Balanced', value: 'balanced' },
-                { name: 'Aggressive', value: 'aggressive' },
+                { name: 'Safe (track only, no intervention)', value: 'safe' },
+                { name: 'Balanced (warn on loops)', value: 'balanced' },
+                { name: 'Aggressive (auto-intervene on loops)', value: 'aggressive' },
             ],
         });
         const responseStyle = await select({
             message: 'Response Style:',
             choices: [
-                { name: 'Normal', value: 'normal' },
-                { name: 'Concise', value: 'concise' },
-                { name: 'Patch-only', value: 'patch_only' },
-                { name: 'Commands-only', value: 'commands_only' },
+                { name: 'Normal (no modification)', value: 'normal' },
+                { name: 'Concise (minimal explanations)', value: 'concise' },
+                { name: 'Patch-only (code changes only)', value: 'patch_only' },
+                { name: 'Commands-only (shell commands only)', value: 'commands_only' },
             ],
         });
-        console.log(`\nLaunching ${agent === 'claude' ? 'Claude Code' : 'OpenCode'} (optimized)...\n`);
+        const displayName = agent === 'claude' ? 'Claude Code' : 'OpenCode';
+        console.log(`\nLaunching ${displayName} (optimized)...\n`);
         const config = {
             name: agent,
             optimizationLevel: optimizationLevel,
