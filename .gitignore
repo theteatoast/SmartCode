@@ -1,2 +1,6 @@
 node_modules
+dist
 goal.md
+smartcode.db
+*.db-journal
+*.db-wal
